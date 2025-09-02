@@ -26,10 +26,13 @@
 import os
 import sys
 
+sys.path.insert(0, "/root/ifupdown2/ifupdown2")
+#sys.path.append("/usr/share/ifupdown2/")
+
 try:
     from ifupdown2.lib.log import LogManager, root_logger
     from ifupdown2.lib.status import Status
-except Exception:
+except ModuleNotFoundError:
     from lib.log import LogManager, root_logger
     from lib.status import Status
 
@@ -47,7 +50,7 @@ try:
 
     from ifupdown2.ifupdown.client import Client
     from ifupdown2.ifupdown.exceptions import ArgvParseHelp, ArgvParseError
-except Exception:
+except ModuleNotFoundError:
     import ifupdown.config as config
 
     config.__version__ = __import__("__init__").__version__
@@ -79,6 +82,9 @@ def client():
 
 
 def stand_alone():
+    from datetime import datetime
+    start_time = datetime.now()
+
     if not sys.argv[0].endswith("query") and os.geteuid() != 0:
         sys.stderr.write('must be root to run this command\n')
         return 1
@@ -107,7 +113,8 @@ def stand_alone():
                 NetlinkListenerWithCache.get_instance().cleanup()
         except NetlinkListenerWithCacheErrorNotInitialized:
             status = Status.Client.STATUS_NLERROR
-    LogManager.get_instance().write("exit status %s" % status)
+
+    LogManager.get_instance().write(f"exit status {status} in {datetime.now() - start_time}")
 
     if status != 0:
         LogManager.get_instance().report_error_to_systemd()
