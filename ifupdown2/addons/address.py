@@ -4,6 +4,7 @@
 # Author: Roopa Prabhu, roopa@cumulusnetworks.com
 #
 
+import re
 import socket
 import json
 import time
@@ -12,7 +13,7 @@ import subprocess
 from setuptools.dist import strtobool
 
 try:
-    from ifupdown2.lib.addon import AddonWithIpBlackList
+    from ifupdown2.lib.addon import AddonWithIpBlackList, AddonException
     from ifupdown2.nlmanager.nlmanager import Link
 
     from ifupdown2.ifupdown.iface import ifaceType, ifaceLinkKind, ifaceLinkPrivFlags, ifaceStatus, iface
@@ -27,8 +28,8 @@ try:
     import ifupdown2.ifupdown.policymanager as policymanager
     import ifupdown2.ifupdown.ifupdownflags as ifupdownflags
     import ifupdown2.ifupdown.ifupdownconfig as ifupdownconfig
-except (ImportError, ModuleNotFoundError):
-    from lib.addon import AddonWithIpBlackList
+except ImportError:
+    from lib.addon import AddonWithIpBlackList, AddonException
     from nlmanager.nlmanager import Link
 
     from ifupdown.iface import ifaceType, ifaceLinkKind, ifaceLinkPrivFlags, ifaceStatus, iface
@@ -188,6 +189,12 @@ class address(AddonWithIpBlackList, moduleBase):
                 'default': 'off',
                 'example': ['arp-accept on']
             },
+            "disable-ipv6": {
+                "help": "disable IPv6",
+                "validvals": ['on', 'off', 'yes', 'no', '0', '1'],
+                "default": "no",
+                "aliases": ["disable-ip6"]
+            }
         }
     }
 
@@ -255,6 +262,16 @@ class address(AddonWithIpBlackList, moduleBase):
             module_name=self.__class__.__name__,
             attr="check_l3_svi_ip_forwarding")
         )
+
+        self.default_loopback_scope = policymanager.policymanager_api.get_module_globals(
+            module_name=self.__class__.__name__,
+            attr="default_loopback_scope"
+        )
+        self.logger.debug(f"policy: default_loopback_scope set to {self.default_loopback_scope}")
+        self.valid_scopes = self.get_mod_subattr("scope", "validvals")
+
+        self.mac_regex = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+
 
     def __policy_get_default_mtu(self):
         default_mtu = policymanager.policymanager_api.get_attr_default(
@@ -360,12 +377,12 @@ class address(AddonWithIpBlackList, moduleBase):
 
                 if vlan_addr and vlan_ipforward_off:
                     if syntax_check:
-                        raise Exception(
+                        raise AddonException(
                             'configuring ip-forward off and ip address(es) (%s) is not compatible'
                             % (', '.join(vlan_addr))
                         )
                     else:
-                        raise Exception(
+                        raise AddonException(
                             '%s: configuring ip-forward off and ip address(es) (%s) is not compatible'
                             % (ifname, ', '.join(vlan_addr))
                         )
@@ -406,7 +423,7 @@ class address(AddonWithIpBlackList, moduleBase):
     def _syntax_check_multiple_gateway(self, family, found, addr, version):
         if ipnetwork.IPNetwork(addr).version == version:
             if found:
-                raise Exception('%s: multiple gateways for %s family'
+                raise AddonException('%s: multiple gateways for %s family'
                                 % (addr, family))
             return True
         return False
@@ -444,11 +461,10 @@ class address(AddonWithIpBlackList, moduleBase):
         arp_accept = utils.boolean_support_binary(arp_accept)
         is_vlan_dev_on_vlan_aware_bridge = False
         is_bridge = self.cache.get_link_kind(ifaceobj.name) == 'bridge'
-        if not is_bridge:
-            if ifaceobj.link_kind & ifaceLinkKind.VLAN:
-                bridgename = ifaceobj.lowerifaces[0]
-                vlan = self._get_vlan_id(ifaceobj)
-                is_vlan_dev_on_vlan_aware_bridge = self.cache.bridge_is_vlan_aware(bridgename)
+        if not is_bridge and ifaceobj.link_kind & ifaceLinkKind.VLAN:
+            bridgename = ifaceobj.lowerifaces[0]
+            vlan = self._get_vlan_id(ifaceobj)
+            is_vlan_dev_on_vlan_aware_bridge = self.cache.bridge_is_vlan_aware(bridgename)
         if ((is_bridge and not self.cache.bridge_is_vlan_aware(ifaceobj.name))
                         or is_vlan_dev_on_vlan_aware_bridge):
             if self._address_valid(addrs):
@@ -486,6 +502,33 @@ class address(AddonWithIpBlackList, moduleBase):
             else:
                 self.iproute2.bridge_fdb_del(bridgename, hwaddress, vlan)
 
+        if is_bridge:
+            # Get the link hwaddress of bridge if we cannot find it in defaults
+            if not hwaddress:
+                hwaddress = self.cache.get_link_address(ifaceobj.name)
+
+            # we need to do an fdb check during bridge processing and purge stale macs
+            fdbs = self._get_bridge_fdbs(ifaceobj.name)
+
+            # Save the permanent MACs for comparison too, as this can be used to preserve
+            # perm entries for VRR interfaces.
+            valid_macs = set([utils.mac_str_to_int(i) for i in fdbs.get('permanent', [])])
+            # Add the actual bridge MAC to this set too.
+            valid_macs.add(utils.mac_str_to_int(hwaddress))
+
+            # Now iterate and purge if it's not a valid mac.
+            for vlan, macs in fdbs.items():
+                for mac in macs:
+                    if utils.mac_str_to_int(mac) not in valid_macs:
+                        self.logger.info(f"{ifaceobj.name}: stale fdb entry ({mac}) detected on vlan {vlan}")
+                        try:
+                            if vlan == 'permanent':
+                                self.iproute2.bridge_fdb_del(ifaceobj.name, mac)
+                            else:
+                                self.iproute2.bridge_fdb_del(ifaceobj.name, mac, vlan)
+                        except Exception as e:
+                            self.logger.debug(f"{ifaceobj.name}: bridge_fdb_del failed: {str(e)}")
+
     def __get_ip_addr_with_attributes(self, ifaceobj_list, ifname):
         user_config_ip_addrs_list = []
 
@@ -519,6 +562,18 @@ class address(AddonWithIpBlackList, moduleBase):
                         attr_value = ifaceobj.get_attr_value_n(attr_name, index)
                         if attr_value:
                             addr_attributes[attr_name] = attr_value
+
+                    scope = None
+                    if addr_obj.ip.is_loopback and "scope" not in addr_attributes and self.default_loopback_scope:
+                        scope = addr_attributes["scope"] = self.default_loopback_scope
+
+                    if scope and scope not in self.valid_scopes:
+                        self.logger.warning(f"{ifname}: invalid scope ({scope}) for {addr}")
+                        self.logger.warning(f"valid scopes: {self.valid_scopes}")
+                        try:
+                            del addr_attributes["scope"]
+                        except:
+                            pass
 
                     pointopoint = ifaceobj.get_attr_value_n("pointopoint", index)
                     try:
@@ -784,6 +839,16 @@ class address(AddonWithIpBlackList, moduleBase):
         return retval
 
     def _propagate_mtu_to_upper_devs(self, ifaceobj, mtu_str, mtu_int, ifaceobj_getfunc):
+        if not (
+                (not ifupdownflags.flags.ALL or ifupdownconfig.diff_mode) and
+                not ifaceobj.link_kind and
+                ifupdownconfig.config.get('adjust_logical_dev_mtu', '1') != '0'
+        ):
+            # This is additional cost to us, so do it only when
+            # ifupdown2 is called on a particular interface and
+            # it is a physical interface (or diff mode)
+            return
+
         if (not ifaceobj.upperifaces or
             (ifaceobj.link_privflags & ifaceLinkPrivFlags.BOND_SLAVE) or
             (ifaceobj.link_privflags & ifaceLinkPrivFlags.VRF_SLAVE) or
@@ -807,18 +872,9 @@ class address(AddonWithIpBlackList, moduleBase):
 
         if mtu_int != self.cache.get_link_mtu(ifaceobj.name):
             self.sysfs.link_set_mtu(ifaceobj.name, mtu_str=mtu_str, mtu_int=mtu_int)
+            self._propagate_mtu_to_upper_devs(ifaceobj, mtu_str, mtu_int, ifaceobj_getfunc)
 
-            if (not ifupdownflags.flags.ALL and
-                    not ifaceobj.link_kind and
-                    ifupdownconfig.config.get('adjust_logical_dev_mtu', '1') != '0'):
-                # This is additional cost to us, so do it only when
-                # ifupdown2 is called on a particular interface and
-                # it is a physical interface
-                self._propagate_mtu_to_upper_devs(ifaceobj, mtu_str, mtu_int, ifaceobj_getfunc)
-        return
-
-    def _process_mtu_config_mtu_none(self, ifaceobj):
-
+    def _process_mtu_config_mtu_none(self, ifaceobj, ifaceobj_getfunc):
         if (ifaceobj.link_privflags & ifaceLinkPrivFlags.MGMT_INTF):
             return
 
@@ -863,6 +919,8 @@ class address(AddonWithIpBlackList, moduleBase):
             # on which devices we want to reset mtu to default.
             # essentially only physical interfaces which are not bond slaves
             self.sysfs.link_set_mtu(ifaceobj.name, mtu_str=self.default_mtu, mtu_int=self.default_mtu_int)
+            if ifupdownconfig.diff_mode:
+                self._propagate_mtu_to_upper_devs(ifaceobj, self.default_mtu, self.default_mtu_int, ifaceobj_getfunc)
 
     def _set_bridge_forwarding(self, ifaceobj):
         """ set ip forwarding to 0 if bridge interface does not have a
@@ -912,7 +970,7 @@ class address(AddonWithIpBlackList, moduleBase):
 
         if (ifaceobj.link_kind & ifaceLinkKind.BRIDGE):
             self._set_bridge_forwarding(ifaceobj)
-            return
+
         if not self.syntax_check_sysctls(ifaceobj):
             return
         if not self.syntax_check_l3_svi_ip_forward(ifaceobj):
@@ -1007,7 +1065,7 @@ class address(AddonWithIpBlackList, moduleBase):
 
             self._process_mtu_config_mtu_valid(ifaceobj, ifaceobj_getfunc, mtu_str, mtu_int)
         else:
-            self._process_mtu_config_mtu_none(ifaceobj)
+            self._process_mtu_config_mtu_none(ifaceobj, ifaceobj_getfunc)
 
     def up_ipv6_addrgen(self, ifaceobj):
         user_configured_ipv6_addrgen = ifaceobj.get_attr_value_first('ipv6-addrgen')
@@ -1040,12 +1098,37 @@ class address(AddonWithIpBlackList, moduleBase):
         else:
             self.logger.warning('%s: invalid value "%s" for attribute ipv6-addrgen' % (ifaceobj.name, user_configured_ipv6_addrgen))
 
+    def disable_ipv6(self, ifaceobj):
+        user_config = ifaceobj.get_attr_value_first("disable-ipv6")
+        sysfs_path = f"/proc/sys/net/ipv6/conf/{ifaceobj.name}/disable_ipv6"
+
+        if not user_config:
+            # check if disable-ipv6 was removed from the stanza
+            for old_ifaceobj in statemanager.statemanager_api.get_ifaceobjs(ifaceobj.name) or []:
+                old_value = old_ifaceobj.get_attr_value_first("disable-ipv6")
+
+                if old_value:
+                    default_bool = utils.get_boolean_from_string(
+                        self.get_mod_subattr("disable-ipv6", "default")
+                    )
+
+                    if default_bool != utils.get_boolean_from_string(old_value):
+                        self.sysfs.write_to_file(sysfs_path, "1" if default_bool else "0")
+                        return
+        else:
+            user_config_bool = utils.get_boolean_from_string(user_config)
+
+            if user_config_bool != utils.get_boolean_from_string(self.sysfs.read_file_oneline(sysfs_path)):
+                self.sysfs.write_to_file(sysfs_path, "1" if user_config_bool else "0")
+
     def _pre_up(self, ifaceobj, ifaceobj_getfunc=None):
         if not self.cache.link_exists(ifaceobj.name):
             return
 
         if not self.syntax_check_enable_l3_iface_forwardings(ifaceobj, ifaceobj_getfunc):
             return
+
+        self.disable_ipv6(ifaceobj)
 
         #
         # alias
@@ -1166,6 +1249,28 @@ class address(AddonWithIpBlackList, moduleBase):
             return
         self._settle_dad(ifaceobj, [ip for ip, _ in user_addrs_list if ip.version == 6])
 
+    def validate_mac(self, mac):
+        if not mac:
+            return False
+        if not bool(self.mac_regex.match(mac)):
+            raise Exception("Invalid MAC address from policy: %s" % mac)
+        return True
+
+    def process_hwaddress_reset_to_default(self, ifaceobj):
+        if not ifaceobj.link_kind and ifaceobj.link_privflags & ifaceLinkPrivFlags.BOND_SLAVE:
+            # if the switch port is part of a bond we shouldn't revert the mac address
+            return None
+
+        iface_defaults = policymanager.policymanager_api.get_iface_defaults("address")
+
+        if iface_defaults:
+            interface_mac_default = iface_defaults.get(ifaceobj.name, {}).get("hwaddress")
+
+            if self.validate_mac(interface_mac_default):
+                return interface_mac_default
+
+        return None
+
     def process_hwaddress(self, ifaceobj):
         hwaddress = self._get_hwaddress(ifaceobj)
 
@@ -1180,7 +1285,9 @@ class address(AddonWithIpBlackList, moduleBase):
                 if not hwaddress:
                     return None, None
             else:
-                return None, None
+                hwaddress = self.process_hwaddress_reset_to_default(ifaceobj)
+                if not hwaddress:
+                    return None, None
 
         if not ifupdownflags.flags.PERFMODE:  # system is clean
             running_hwaddress = self.cache.get_link_address(ifaceobj.name)
@@ -1199,7 +1306,17 @@ class address(AddonWithIpBlackList, moduleBase):
                     self.netlink.link_down(l)
                 slave_down = True
             try:
-                self.netlink.link_set_address(ifaceobj.name, hwaddress, hwaddress_int)
+                if ifaceobj.link_privflags & ifaceLinkPrivFlags.BOND_SLAVE and ifaceobj.get_attr_value("hwaddress"):
+                    master_ifname = self.cache.get_master(ifaceobj.name)
+                    if master_ifname:
+                        self.log_error("%s: setting hwaddress is not permitted on an existing bond slave" % ifaceobj.name, ifaceobj=ifaceobj)
+
+                self.netlink.link_set_address(
+                    ifaceobj.name,
+                    hwaddress,
+                    hwaddress_int,
+                    keep_link_down=ifaceobj.link_privflags & ifaceLinkPrivFlags.KEEP_LINK_DOWN
+                )
                 old_mac_addr = running_hwaddress
             finally:
                 if slave_down:
@@ -1251,26 +1368,33 @@ class address(AddonWithIpBlackList, moduleBase):
                 if alias:
                     self.sysfs.link_set_alias(ifaceobj.name, None)  # None to reset alias.
 
-            # XXX hwaddress reset cannot happen because we dont know last
-            # address.
+            hwaddress = self.process_hwaddress_reset_to_default(ifaceobj)
+            if hwaddress != None and not ifaceobj.link_kind:
+                hwaddress_int = utils.mac_str_to_int(hwaddress)
+                self.netlink.link_set_address(
+                    ifaceobj.name,
+                    hwaddress,
+                    hwaddress_int,
+                    keep_link_down=ifaceobj.link_privflags & ifaceLinkPrivFlags.KEEP_LINK_DOWN
+                )
+            else:
+              # Handle special things on a bridge
+              hwaddress = self._get_hwaddress(ifaceobj)
+              if not hwaddress:
+                  hwaddress = self.cache.get_link_address(ifaceobj.name)
 
-            # Handle special things on a bridge
-            hwaddress = self._get_hwaddress(ifaceobj)
-            if not hwaddress:
-                hwaddress = self.cache.get_link_address(ifaceobj.name)
             self._process_bridge(ifaceobj, False, hwaddress, None)
         except Exception as e:
             self.logger.debug('%s : %s' %(ifaceobj.name, str(e)))
-            pass
 
-    def _get_bridge_fdbs(self, bridgename, vlan):
+    def _get_bridge_fdbs(self, bridgename, vlan=None):
         fdbs = self._bridge_fdb_query_cache.get(bridgename)
         if not fdbs:
            fdbs = self.iproute2.bridge_fdb_show_dev(bridgename)
            if not fdbs:
-              return
+              return {}
            self._bridge_fdb_query_cache[bridgename] = fdbs
-        return fdbs.get(vlan)
+        return fdbs.get(vlan) if vlan else fdbs
 
     def _check_addresses_in_bridge(self, ifaceobj, hwaddress):
         """ If the device is a bridge, make sure the addresses
@@ -1326,7 +1450,6 @@ class address(AddonWithIpBlackList, moduleBase):
             ifaceobjcurr.update_config_with_status('mpls-enable',
                                                    running_mpls_enable,
                                             mpls_enable != running_mpls_enable)
-        return
 
     def query_check_ipv6_addrgen(self, ifaceobj, ifaceobjcurr):
         ipv6_addrgen = ifaceobj.get_attr_value_first('ipv6-addrgen')
@@ -1343,18 +1466,32 @@ class address(AddonWithIpBlackList, moduleBase):
         else:
             ifaceobjcurr.update_config_with_status('ipv6-addrgen', ipv6_addrgen, 1)
 
+    def query_check_disable_ipv6(self, ifaceobj, ifaceobjcurr):
+        user_config = ifaceobj.get_attr_value_first("disable-ipv6")
+
+        if not user_config:
+            return
+
+        user_config_bool = utils.get_boolean_from_string(user_config)
+        sysfs_path = f"/proc/sys/net/ipv6/conf/{ifaceobj.name}/disable_ipv6"
+
+        ifaceobjcurr.update_config_with_status(
+            "disable-ipv6",
+            user_config,
+            user_config_bool != utils.get_boolean_from_string(self.sysfs.read_file_oneline(sysfs_path))
+        )
+
     def _query_check(self, ifaceobj, ifaceobjcurr, ifaceobj_getfunc=None):
         """
         TODO: Check broadcast address, scope, etc
         """
-        runningaddrsdict = None
         if not self.cache.link_exists(ifaceobj.name):
             self.logger.debug('iface %s not found' %ifaceobj.name)
             return
 
+        self.query_check_disable_ipv6(ifaceobj, ifaceobjcurr)
         self.query_check_ipv6_addrgen(ifaceobj, ifaceobjcurr)
 
-        addr_method = ifaceobj.addr_method
         self.query_n_update_ifaceobjcurr_attr(ifaceobj, ifaceobjcurr,
                 'mtu', self.cache.get_link_mtu_str)
         hwaddress = self._get_hwaddress(ifaceobj)
