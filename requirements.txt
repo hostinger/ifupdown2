@@ -2,6 +2,6 @@ pytest~=8.0.0
 pytest-order
 paramiko~=3.4.0
 scp~=0.14.5
-setuptools~=58.1.0
+setuptools~=78.1.1
 six~=1.16.0
 deepdiff
