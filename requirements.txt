@@ -1,4 +1,4 @@
-pytest~=8.0.0
+pytest==9.0.3
 pytest-order
 paramiko~=3.4.0
 scp~=0.14.5
